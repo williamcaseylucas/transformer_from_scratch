@@ -7,9 +7,15 @@ from torchtext.data import Field, BucketIterator, Example, Dataset
 import pandas as pd
 import torch
 from tqdm.notebook import tqdm
+from torchtext.data.metrics import bleu_score
 
 # for de: conda install -c conda-forge spacy-model-de_core_news_sm
 # python -m spacy download de_core_news_md
+
+
+spacy_de = spacy.load("de_core_news_md")
+# python -m spacy download en_core_web_md
+spacy_eng = spacy.load("en_core_web_md")
 
 
 def tokenize_germ(text):
@@ -19,10 +25,6 @@ def tokenize_germ(text):
 def tokenize_eng(text):
     return [tok.text for tok in spacy_eng.tokenizer(text)]
 
-
-spacy_de = spacy.load("de_core_news_sm")
-# python -m spacy download en_core_web_md
-spacy_eng = spacy.load("en_core_web_sm")
 
 german = Field(
     tokenize=tokenize_germ, lower=True, init_token="<sos>", eos_token="<eos>"
@@ -71,8 +73,10 @@ def get_train_test_val() -> list[Dataset, Dataset, Dataset]:
 
 train_data, test_data, val_data = get_train_test_val()
 
-english.build_vocab(train_data.src, max_size=10000, min_freq=2)
-german.build_vocab(train_data.tgt, max_size=10000, min_freq=2)
+vars(train_data[0])
+
+german.build_vocab(train_data.src, max_size=10000, min_freq=2)
+english.build_vocab(train_data.tgt, max_size=10000, min_freq=2)
 
 
 class Transformer(nn.Module):
@@ -127,6 +131,8 @@ class Transformer(nn.Module):
         ) = src.shape
         trg_seq_len, N = trg.shape
 
+        # normally you need last part of arange to match last part of expand
+        # by unsqueezing(1), we can end with src_seq_len and start with src_seq_len
         src_positions = (
             torch.arange(0, src_seq_len)
             .unsqueeze(1)
@@ -166,6 +172,8 @@ class Transformer(nn.Module):
             tgt_mask=trg_mask,
         )
 
+        out = self.fc_out(out)
+
         return out
 
 
@@ -176,11 +184,11 @@ save_model = True
 # Train hyperparams
 num_epochs = 5
 learning_rate = 3e-4
-batch_size = 32
+batch_size = 200
 
 # Model hyperparams
-src_vocab_size = len(english.vocab)
-trg_vocab_size = len(german.vocab)
+src_vocab_size = len(german.vocab)
+trg_vocab_size = len(english.vocab)
 embedding_size = 512
 num_heads = 8
 num_encoder_layers = 3
@@ -218,15 +226,74 @@ model_name = "my_checkpoint.pth.ptar"
 
 
 def translate_sentence(model, sentence, german, english, device, max_length=100):
-    tokenized_sentence = tokenize_eng(sentence)
-    indexed_sentence = [english.vocab.stoi[token] for token in tokenized_sentence]
-    indexed_sentence = torch.tensor(indexed_sentence).to(device)
+    # Load german tokenizer
+    spacy_ger = spacy_de
 
+    # Create tokens using spacy and everything in lower case (which is what our vocab is)
+    if type(sentence) == str:
+        tokens = [token.text.lower() for token in spacy_ger(sentence)]
+    else:
+        tokens = [token.lower() for token in sentence]
+
+    # Add <SOS> and <EOS> in beginning and end respectively
+    tokens.insert(0, german.init_token)
+    tokens.append(german.eos_token)
+
+    # Go through each german token and convert to an index
+    text_to_indices = [german.vocab.stoi[token] for token in tokens]
+
+    # Convert to Tensor
+    sentence_tensor = torch.LongTensor(text_to_indices).unsqueeze(1).to(device)
+
+    outputs = [english.vocab.stoi["<sos>"]]
     model.eval()
-    with torch.no_grad():
-        outputs = model(indexed_sentence, indexed_sentence)
+    for i in range(max_length):
+        trg_tensor = torch.LongTensor(outputs).unsqueeze(1).to(device)
 
-    print("outputs.shape", outputs.shape)
+        with torch.no_grad():
+            output = model(sentence_tensor, trg_tensor)
+
+        best_guess = output.argmax(2)[-1, :].item()
+        outputs.append(best_guess)
+
+        if best_guess == english.vocab.stoi["<eos>"]:
+            break
+
+    translated_sentence = [
+        english.vocab.itos[idx] for idx in outputs
+    ]  # is german for some reason
+    # remove start token
+    return translated_sentence[1:]
+
+
+def bleu(data, model, german, english, device):
+    if load_model:
+        print("=> Loading checkpoint")
+        checkpoint = torch.load(model_name)
+        model.load_state_dict(checkpoint["state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+
+    targets = []
+    outputs = []
+
+    for _, example in tqdm(enumerate(data), total=len(data)):
+        # 1. one way of doing this
+        # src = vars(example)["src"]
+        # tgt = vars(example)["tgt"]
+        # 2. another way of dooing this
+        src = example.src
+        tgt = example.tgt
+
+        prediction = translate_sentence(model, src, german, english, device)
+        prediction = prediction[:-1]  # remove <eos> token
+
+        targets.append([tgt])
+        outputs.append(prediction)
+        print(f"source: {src}")
+        print(f"target: {tgt}")
+        print()
+
+    return bleu_score(outputs, targets)
 
 
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -239,8 +306,8 @@ if load_model:
     optimizer.load_state_dict(checkpoint["optimizer"])
     step = checkpoint["step"]
 
-sentence = "ein pferd geht unter einer brucke neben einem boot"
-
+sentence = "ein pferd geht unter einer brücke neben einem boot."
+target_sentence = "A horse walks under a bridge next to a boat."
 
 for epoch in range(num_epochs):
     print(f"Epoch {epoch + 1}/{num_epochs}")
@@ -253,8 +320,8 @@ for epoch in range(num_epochs):
         print("=> Saving checkpoint")
         torch.save(checkpoint, model_name)
 
-    """translated_sentence = translate_sentence(model, sentence, german, english, device)
-    print(f"Translated example sentence: \n {translated_sentence}")"""
+    translated_sentence = translate_sentence(model, sentence, german, english, device)
+    print(f"Translated example sentence: \n {translated_sentence}")
 
     model.train()
     for batch_idx, batch in tqdm(enumerate(train_iterator), total=len(train_iterator)):
@@ -276,5 +343,5 @@ for epoch in range(num_epochs):
         writer.add_scalar("Training loss", loss, global_step=step)
         step += 1
 
-# score = bleu(test_data, model, german, english, device)
-# print(f"BLEU score = {score * 100:.2f}")
+score = bleu(test_data, model, german, english, device)
+print(f"BLEU score = {score * 100:.2f}")
