@@ -8,6 +8,8 @@ import pandas as pd
 import torch
 from tqdm.notebook import tqdm
 from torchtext.data.metrics import bleu_score
+import numpy as np
+
 
 # for de: conda install -c conda-forge spacy-model-de_core_news_sm
 # python -m spacy download de_core_news_md
@@ -266,6 +268,43 @@ def translate_sentence(model, sentence, german, english, device, max_length=100)
     return translated_sentence[1:]
 
 
+def translate_sentences(model, sentences, german, english, device):
+    sentence_len, N = sentences.shape
+
+    targets = torch.LongTensor(
+        np.repeat([[english.vocab.stoi["<sos>"]]], N, axis=1)
+    ).to(device)
+
+    outputs = torch.zeros((sentence_len, N), dtype=torch.long).to(device)
+
+    model.eval()
+    for i in range(sentence_len):
+        with torch.no_grad():
+            output = model(sentences, targets)  # 1, 200, 5893
+
+        best_guesses = output.argmax(2).squeeze(0)  # (1, 200)
+
+        outputs[i] = best_guesses
+
+        targets = best_guesses.unsqueeze(0)  # (200) -> (1, 200)
+
+        # if best_guess == english.vocab.stoi["<eos>"]:
+        #     break
+
+    outputs_flipped = torch.einsum("ij->ji", outputs)  # (11, 200) -> (200, 11)
+
+    translated_sentence = torch.tensor(
+        [[english.vocab.itos[idx] for idx in output] for output in outputs_flipped]
+    ).transpose(0, 1)
+    print("translated_sentence.shape: ", translated_sentence.shape)
+    print(
+        "translated_sentence: ",
+        [" ".join(sentence) for sentence in translated_sentence],
+    )
+    # remove start token
+    return translated_sentence[1:, :]
+
+
 def bleu(data, model, german, english, device):
     if load_model:
         print("=> Loading checkpoint")
@@ -286,14 +325,53 @@ def bleu(data, model, german, english, device):
 
         prediction = translate_sentence(model, src, german, english, device)
         prediction = prediction[:-1]  # remove <eos> token
-
         targets.append([tgt])
         outputs.append(prediction)
-        print(f"source: {src}")
-        print(f"target: {tgt}")
-        print()
 
     return bleu_score(outputs, targets)
+
+
+# def bleu_iterator(data, model, german, english, device):
+#     if load_model:
+#         print("=> Loading checkpoint")
+#         checkpoint = torch.load(model_name)
+#         model.load_state_dict(checkpoint["state_dict"])
+#         optimizer.load_state_dict(checkpoint["optimizer"])
+
+#     targets = []
+#     outputs = []
+
+#     for _, example in tqdm(enumerate(data), total=len(data)):
+#         # 1. one way of doing this
+#         # src = vars(example)["src"]
+#         # tgt = vars(example)["tgt"]
+#         # 2. another way of dooing this
+#         src = example.src.to(device)
+#         tgt = example.tgt.to(device)
+
+#         print("src.shape: ", src.shape)
+#         print("tgt.shape: ", tgt.shape)
+
+#         predictions = translate_sentences(model, src, german, english, device)
+#         predictions = predictions[:-1, :]  # remove <eos> token
+
+#         tgt = tgt.transpose(0, 1)
+#         tgt = np.array(
+#             [[english.vocab.itos[word] for word in sentence] for sentence in tgt]
+#         ).transpose(0, 1)
+#         # print("tgt.shape: ", tgt.shape)
+#         print("tgt: ", tgt)
+
+#         targets.append(tgt)
+#         outputs.append(predictions)
+
+#     print("final targets: ", targets)
+#     print("final outputs: ", outputs)
+#     return bleu_score(outputs, targets)
+
+
+# score = bleu_iterator(test_iterator, model, german, english, device)
+# print(f"BLEU score = {score * 100:.2f}")
 
 
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -345,3 +423,4 @@ for epoch in range(num_epochs):
 
 score = bleu(test_data, model, german, english, device)
 print(f"BLEU score = {score * 100:.2f}")
+# BLEU score = 31.03
